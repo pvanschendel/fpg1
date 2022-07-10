@@ -56,10 +56,13 @@ module emu
    output            AUDIO_S                 /* 1 - signed audio samples, 0 - unsigned */
 );
 
+assign LED_USER   =  tape_led | ioctl_download;
+
 `include "build_id.v"
 localparam CONF_STR = {
    "PDP1;;",
    "-;",
+   "H0S0,PDPRIMBIN,Mount punched tape;",
    "F,PDPRIMBIN;",
    "T5,Enable RIM mode;",
    "T6,Disable RIM mode;",
@@ -101,12 +104,27 @@ wire  [1:0] current_output_device;                                   /* Currentl
 wire        clk_108, pll_locked;                                     /* Clock wires */
 wire        kbd_read_strobe, console_switch_strobe;                  /* These signal when a key was pressed */
 
-wire        ioctl_download, ioctl_wr, send_next_tape_char;           /* Tape (file download) ioctl interface */
+wire        ioctl_download, ioctl_wr, read_paper_binary;             /* Tape (file download) ioctl interface */
 wire [24:0] ioctl_addr;
 wire  [7:0] ioctl_dout, ioctl_index;
 
 wire [10:0] ps2_key, console_switches;                               /* Pressed key on keyboard, pressed switches on console */
 wire  [5:0] sense_switches;
+
+wire [31:0] sd_lba;
+wire  [5:0] sd_blk_cnt;
+wire        sd_rd;
+wire        sd_wr;
+wire        sd_ack;
+wire [13:0] sd_buff_addr;
+wire  [7:0] sd_buff_dout;
+wire  [7:0] sd_buff_din;
+wire        sd_buff_wr;
+wire        img_mounted;
+wire [31:0] img_size;
+wire        img_readonly;
+wire        tape_led;
+wire  [7:0] tape_reader_data;
 
 wire [15:0] joystick_0, joystick_1;                                  /* Pressed keys on joysticks */
 
@@ -145,13 +163,13 @@ reg  [1:0] current_output;                                           /* What dev
 reg [11:0] write_address = 12'd0;                                    /* Addresses for writing to memory and start jump location after loading a program in RIM mode or RESET */
 reg [11:0] start_address = 12'd4;
 
-reg [17:0] tape_rcv_word,                                            /* tape_rcv_word used to store received binary word from tape */
+reg [17:0] memoy_injection_word,                                     /* memoy_injection_word used to store received binary word from tape for memory injection */
+           tape_rcv_word,                                            /* tape_rcv_word used to store received binary word from tape for loading by cpu */
            io_word;                                                  /* io_word used to provide spacewar gamepad controls */
 
-reg        write_enable, rim_mode_enabled;                           /* Enables writing to memory or activating the read in mode (i.e. something like a paper tape bootloader) */
+reg        write_enable, rim_mode_enabled;                           /* Enables writing to memory or activating the read in mode (i.e. something like a punched tape bootloader) */
 
-reg [35:0] tape_read_buffer = 36'b0;                                 /* Buffer for storing lines received from paper tape */
-reg [31:0] timeout = 0;                                              /* Timeout provides a control mechanism to abort a "stuck" paper tape download */
+reg [31:0] timeout = 0;                                              /* Timeout provides a control mechanism to abort a "stuck" punched tape download */
 reg [10:0] horizontal_counter, vertical_counter;                     /* Position counters used for generating the video signal, common to all three video output modules */
 
 
@@ -160,7 +178,7 @@ reg [10:0] horizontal_counter, vertical_counter;                     /* Position
 assign HDMI_ARX = `menu_aspect_ratio ? 8'd16  : 8'd5;
 assign HDMI_ARY = `menu_aspect_ratio ? 8'd9   : 8'd4;
 
-assign LED_USER = key_was_processed_w;
+//assign LED_USER = key_was_processed_w;
 
 assign VGA_CLK  = clk_108;
 assign VGA_CE   = 1'b1;
@@ -209,6 +227,20 @@ hps_io #(.STRLEN($size(CONF_STR)>>3), .PS2DIV(200)) hps_io
 
    .joystick_0(joystick_0),
    .joystick_1(joystick_1),
+
+   .sd_lba(sd_lba),
+   // .sd_blk_cnt(sd_blk_cnt), // not in framework
+   .sd_rd(sd_rd),
+   .sd_wr(sd_wr),
+   .sd_ack(sd_ack),
+
+   .sd_buff_addr(sd_buff_addr),
+   .sd_buff_dout(sd_buff_dout),
+   .sd_buff_din(sd_buff_din),
+   .sd_buff_wr(sd_buff_wr),
+   .img_mounted(img_mounted),
+   .img_size(img_size),
+   .img_readonly(img_readonly),
 
    .ps2_key(ps2_key)
 );
@@ -287,7 +319,7 @@ pdp1_main_ram ram_memory(
 
    .clock_b(CLK_50M),
    .address_b(write_address),
-   .data_b(tape_rcv_word),
+   .data_b(memoy_injection_word),
    .wren_b(write_enable)
 );
 
@@ -340,7 +372,7 @@ cpu pdp1_cpu(
    .typewriter_strobe_in(kbd_read_strobe),
    .typewriter_strobe_ack(key_was_processed_w),
 
-   .send_next_tape_char(send_next_tape_char),
+   .send_next_tape_char(read_paper_binary),
    .is_char_available(ioctl_wait),
    .tape_rcv_word(tape_rcv_word),
 
@@ -353,95 +385,148 @@ cpu pdp1_cpu(
    .hw_mul_enabled(hw_mul_enabled)
 );
 
+paper_tape paper_tape_reader(
+   .clk(CLK_50M),
+   .reset(RESET),
+   .ce(1), //???
+
+   .img_mounted(img_mounted),
+   .img_readonly(img_readonly),
+   .img_size(img_size),
+
+   .led(tape_led),
+
+   //clk_sys ports
+   .clk_sys(CLK_50M),
+
+   .sd_lba(sd_lba),
+   //.sd_blk_cnt(sd_blk_cnt), ///
+   .sd_rd(sd_rd),
+   .sd_wr(sd_wr),
+   .sd_ack(sd_ack),
+   .sd_buff_addr(sd_buff_addr), /// [8:0 ?
+   .sd_buff_dout(sd_buff_dout),
+   .sd_buff_din(sd_buff_din),
+   .sd_buff_wr(sd_buff_wr)
+
+   .reader_data(tape_reader_data),
+   .reader_valid(tape_reader_valid),
+   .reader_ready(tape_reader_ready)
+);
 
 ////////////////  ALWAYS BLOCKS  //////////////////
+
+/* Photoelectric Tape Reader */
+
+always @(posedge CLK_50M) begin
+   reg       read_binary_mode;
+   reg [1:0] read_coumt;
+   reg       old_read_paper_binary;
+   reg [17:0] Read_Buffer = 0;                                 /* Buffer for storing lines received from punched tape */
+
+   old_read_paper_binary <= read_paper_binary;
+   if (!old_read_paper_binary && read_paper_binary) begin
+      tape_reader_ready <= 1;
+      read_binary_mode <= 1;
+      read_coumt <= 2'b1;
+      Read_Buffer <= 0;
+   end //else if (read_paper_alpha) begin
+//      tape_reader_ready <= 1;
+//      read_binary_mode <= 0;
+//      read_coumt <= 2'b3;
+// end
+
+   if (tape_reader_valid) begin
+      if (read_binary_mode) begin
+         /* 8th bit must be a one in binary mode. If not, don't even increment counter - simply ignore it */
+         /* Make one 18-bit word from every 3 bytes, enable write and raise ioctl_wait to skip read in next clock cycle */
+         if (tape_reader_data[7])
+            Read_Buffer <= { Read_Buffer[11:0], tape_reader_data[5:0] };         /* Shift in 6 bits */
+      end else begin
+         Read_Buffer[7:0] <= tape_reader_data;
+         tape_reader_ready <= 0;
+      end
+
+      if (read_coumt != 2'd3) begin
+         read_coumt <= read_coumt + 1;
+      end else begin
+         tape_rcv_word <= Read_Buffer; // tape_rcv_word should be IO bus
+         tape_reader_ready <= 0;
+      end
+   end
+
+
+
+   if (RESET) begin
+      // rising_edge(3NEXT) or POWER_CLEAR
+      read_coumt <= 0;
+      read_binary_mode <= 0;
+   end
+end
+
 
 /* Tape RIM loader and memory image loader */
 
 always @(posedge CLK_50M) begin
-        reg [7:0] cnt;
-        reg       old_send_next_tape_char;
+   reg [7:0] cnt;
+   reg [35:0] tape_read_buffer = 36'b0;                                 /* Buffer for storing lines received from punched tape */
 
-        /* In RIM mode, these two instructions write code to memory (dio) and then jump to beginning to execute (jmp) */
-        localparam jmp   = 6'o60,
-                   dio   = 6'o32;
+   /* In RIM mode, these two instructions write code to memory (dio) and then jump to beginning to execute (jmp) */
+   localparam jmp   = 6'o60,
+               dio   = 6'o32;
 
-        old_send_next_tape_char <= send_next_tape_char;
-        old_download <= ioctl_download;
-        write_enable <= 1'b0;
+   write_enable <= 1'b0;
 
-        if (`menu_enable_rim || `readin_button)
-            rim_mode_enabled <= 1'b1;
+   if (`menu_enable_rim || `readin_button)
+      rim_mode_enabled <= 1'b1;
 
-        else if (`menu_disable_rim)
-        begin
+   else if (`menu_disable_rim) begin
+      rim_mode_enabled <= 1'b0;
+      ioctl_wait <= 1'b0;
+   end
+
+   old_download <= ioctl_download;
+   if(~old_download && ioctl_download) begin
+      cnt <= 8'b0;
+      timeout <= 32'b0;
+   end
+
+   timeout <= timeout + 1'b1;
+
+   /* 8th bit must be a one in binary mode. If not, don't even increment counter - simply ignore it */
+   if(ioctl_wr && ioctl_dout[7]) begin
+      tape_read_buffer <= { tape_read_buffer[29:0], ioctl_dout[5:0] };         /* Shift in 6 bits */
+      cnt <= cnt + 1'b1;
+      timeout <= rim_mode_enabled ? 'b0 : timeout;
+   end
+
+   /* RIM loader mode */
+   if (rim_mode_enabled) begin
+      if (cnt == 8'd6) begin
+         cnt <= 8'b0;
+
+         if (tape_read_buffer[35:30] == jmp) begin
+            start_address <= tape_read_buffer[29:18];
             rim_mode_enabled <= 1'b0;
-            ioctl_wait <= 1'b0;
-        end
 
-        if(~old_download && ioctl_download) begin
-                cnt <= 8'b0;
-                timeout <= 32'b0;
-        end
-
-        timeout <= timeout + 1'b1;
-
-        /* 8th bit must be a one in binary mode. If not, don't even increment counter - simply ignore it */
-        if(ioctl_wr && ioctl_dout[7]) begin
-            tape_read_buffer <= { tape_read_buffer[29:0], ioctl_dout[5:0] };         /* Shift in 6 bits */
-            cnt <= cnt + 1'b1;
-            timeout <= rim_mode_enabled ? 'b0 : timeout;
-        end
+            memoy_injection_word <= tape_read_buffer[17:0];
+            ioctl_wait <= 1'b1;  // We received a character, don't receive anymore until the CPU reads it
+         end
 
 
-        /* Make one 18-bit word from every 3 bytes, enable write and raise ioctl_wait to skip read in next clock cycle */
+         if (tape_read_buffer[35:30] == dio) begin
+            write_address <= tape_read_buffer[29:18];
+            memoy_injection_word <= tape_read_buffer[17:0];
+            write_enable <= 1'b1;
+         end
 
-        if (! rim_mode_enabled)
-        begin
-            if (cnt == 8'd3)  // We read enough data to form a word, ioctl_wait will be cleared when send_next_tape_char is pulsed
-            begin
-               ioctl_wait <= 1'b1;  // We received a character, don't receive anymore until the CPU reads it
-               tape_rcv_word <= tape_read_buffer[17:0];
-               tape_read_buffer <= 36'b0;
-               cnt <= 8'b0;
-            end
+         tape_read_buffer <= 36'b0;
+      end
 
-            /* Detect falling edge of send_next_tape_char input from CPU, that means we can proceed with receiving */
-            if (old_send_next_tape_char && ~send_next_tape_char) begin
-               ioctl_wait <= 0;
-            end
+   end
 
-        end
-
-        /* RIM loader mode */
-        else
-        begin
-            if (cnt == 8'd6)
-            begin
-               cnt <= 8'b0;
-
-               if (tape_read_buffer[35:30] == jmp) begin
-                  start_address <= tape_read_buffer[29:18];
-                  rim_mode_enabled <= 1'b0;
-
-                  tape_rcv_word <= tape_read_buffer[17:0];
-                  ioctl_wait <= 1'b1;  // We received a character, don't receive anymore until the CPU reads it
-               end
-
-
-               if (tape_read_buffer[35:30] == dio) begin
-                  write_address <= tape_read_buffer[29:18];
-                  tape_rcv_word <= tape_read_buffer[17:0];
-                  write_enable <= 1'b1;
-               end
-
-               tape_read_buffer <= 36'b0;
-            end
-
-        end
-
-        /* Timeout after last successful read should not exceed 1 s */
-        if(!ioctl_download || timeout > 32'd50000000) ioctl_wait <= 0;
+   /* Timeout after last successful read should not exceed 1 s */
+   if(!ioctl_download || timeout > 32'd50000000) ioctl_wait <= 0;
 end
 
 
